@@ -7,6 +7,7 @@ from graphcredit_offline.core.graph_builder import extract_math_answer, lexical_
 from graphcredit_offline.core.schema import EventGraph, EventNode
 from graphcredit_offline.rewards.downstream_usage import downstream_usage_score
 from graphcredit_offline.rewards.process_scorers import clip01
+from graphcredit_offline.rewards.verifier_diagnostics import math_verifier_diagnostics
 
 
 @dataclass
@@ -95,23 +96,19 @@ def evaluate_masked_graph(
 
 def _evaluate_math_masked_graph(masked_graph: EventGraph, original_graph: EventGraph, masked_node: EventNode, process_reward: float) -> float:
     original_value = float(original_graph.final_reward or masked_node.final_reward or 0.0)
+    if masked_node.node_type == "verifier_judgment":
+        diagnostics = math_verifier_diagnostics(original_graph, masked_node)
+        return original_value - diagnostics.verifier_reward
+
     support = _final_answer_support(masked_graph)
     usage_before = downstream_usage_score(original_graph, masked_node)
     if original_value > 0:
         if masked_node.node_type in {"agent_message", "agent_action"}:
             support_floor = 0.25 if _has_unmasked_solver_support(masked_graph, original_graph.final_answer) else 0.0
             return clip01(max(support, support_floor))
-        if masked_node.node_type == "verifier_judgment":
-            if _verifier_approves(masked_node):
-                return clip01(0.75 + 0.25 * support)
-            return clip01(max(support, 0.35))
         return clip01(max(support, 1.0 - 0.7 * usage_before))
 
     harmful = clip01(1.0 - process_reward)
-    if masked_node.node_type == "verifier_judgment":
-        if _verifier_approves(masked_node):
-            return clip01(0.35 + 0.35 * harmful + 0.20 * usage_before)
-        return clip01(original_value)
     if masked_node.node_type in {"agent_message", "agent_action"}:
         has_boxed_answer = extract_math_answer(masked_node.output_content) is not None
         misleading_answer = 0.35 if has_boxed_answer else 0.0
@@ -179,11 +176,6 @@ def _has_unmasked_solver_support(graph: EventGraph, final_answer: str | None = N
         )
         for node in graph.nodes
     )
-
-
-def _verifier_approves(node: EventNode) -> bool:
-    output = (node.output_content or "").lower()
-    return "<verify>approve</verify>" in output
 
 
 def _router_stopped(node: EventNode) -> bool:

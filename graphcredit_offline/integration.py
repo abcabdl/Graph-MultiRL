@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from typing import Any
 
@@ -17,6 +18,7 @@ from graphcredit_offline.rewards.downstream_usage import downstream_usage_score
 from graphcredit_offline.rewards.fusion import RewardBreakdown, fuse_node_reward
 from graphcredit_offline.rewards.math_scorer import MathProcessScorer
 from graphcredit_offline.rewards.search_scorer import SearchProcessScorer
+from graphcredit_offline.rewards.verifier_diagnostics import math_verifier_diagnostics
 from graphcredit_offline.rl.grouping import build_graphcredit_group_index
 
 
@@ -39,6 +41,7 @@ def apply_graphcredit_rewards(
     if not gc_config.get("enabled", False):
         return reward_tensor, {}, {}
 
+    gc_config = _to_plain_container(gc_config)
     task_type = str(gc_config.get("task_type", config.agent.get("orchestra_type", "unknown")))
     orchestra_type = str(config.agent.get("orchestra_type", task_type))
     weights = dict(gc_config.get("reward_weights", {}))
@@ -80,9 +83,11 @@ def apply_graphcredit_rewards(
         usage = downstream_usage_score(graph, node)
         cf = offline_masking_credit(graph, node, process.score, task_type=task_type)
         cost = cost_penalty(node, token_budget=token_budget)
-        redundant = redundancy_penalty(graph, node, cf.credit, usage, cost)
         global_reward = float(graph.final_reward or 0.0)
+        cost = _failed_math_solver_cost_floor(task_type, global_reward, node, cost)
+        redundant = redundancy_penalty(graph, node, cf.credit, usage, cost)
         node_weights = _weights_for_node(weights, role_weights, node)
+        verifier_diagnostics = math_verifier_diagnostics(graph, node) if task_type == "math" and node.node_type == "verifier_judgment" else None
         training_cf_credit = cf.credit
         if global_reward <= 0.0:
             training_cf_credit = max(training_cf_credit, failed_negative_clip)
@@ -104,6 +109,8 @@ def apply_graphcredit_rewards(
                 "counterfactual_reason": cf.reason,
                 "raw_counterfactual_credit": cf.credit,
                 "training_counterfactual_credit": training_cf_credit,
+                "applied_weights": dict(node_weights),
+                "verifier_diagnostics": asdict(verifier_diagnostics) if verifier_diagnostics is not None else {},
             }
         )
         breakdowns.append(breakdown)
@@ -142,6 +149,8 @@ def apply_graphcredit_rewards(
                 "redundancy_penalty": breakdown.redundancy_penalty,
                 "process_reason": breakdown.details.get("process_reason", ""),
                 "counterfactual_reason": breakdown.details.get("counterfactual_reason", ""),
+                "applied_weights": breakdown.details.get("applied_weights", {}),
+                "verifier_diagnostics": breakdown.details.get("verifier_diagnostics", {}),
                 "final_answer": graph.final_answer,
                 "output_content": node.output_content,
             }
@@ -177,7 +186,8 @@ def _append_jsonl(path: str, records: list[dict[str, Any]]) -> None:
 def _weights_for_node(base_weights: dict[str, float], role_weights: dict[str, Any], node: EventNode) -> dict[str, float]:
     """Merge global reward weights with optional role/node-type overrides."""
 
-    merged = dict(base_weights)
+    merged = {str(k): float(v) for k, v in _to_plain_container(base_weights).items()}
+    role_weights = _to_plain_container(role_weights)
     candidates = [
         str(node.role or ""),
         str(node.agent_id or ""),
@@ -185,7 +195,7 @@ def _weights_for_node(base_weights: dict[str, float], role_weights: dict[str, An
     ]
     normalized_candidates = {_normalize_key(item) for item in candidates if item}
     for key, override in role_weights.items():
-        if _normalize_key(str(key)) in normalized_candidates and isinstance(override, dict):
+        if _normalize_key(str(key)) in normalized_candidates and isinstance(override, Mapping):
             merged.update({str(k): float(v) for k, v in override.items()})
     return merged
 
@@ -195,6 +205,35 @@ def _normalize_key(value: str) -> str:
     if normalized.endswith("_agent"):
         normalized = normalized[: -len("_agent")]
     return normalized
+
+
+def _failed_math_solver_cost_floor(task_type: str, global_reward: float, node: EventNode, cost: float) -> float:
+    if task_type != "math" or global_reward > 0.0 or node.node_type not in {"agent_message", "agent_action"}:
+        return cost
+    output = node.output_content or ""
+    if "\\boxed" not in output:
+        return cost
+    word_count = len(output.split())
+    if word_count <= 128:
+        return cost
+    return max(float(cost), min(1.0, 0.25 + (word_count - 128) / 384.0))
+
+
+def _to_plain_container(value: Any) -> Any:
+    """Convert OmegaConf containers to plain Python containers when available."""
+
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+    except Exception:
+        pass
+    if isinstance(value, Mapping):
+        return {key: _to_plain_container(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_container(item) for item in value]
+    return value
 
 
 def _decode_batch(data, tokenizers: dict[str, Any] | None = None) -> list[tuple[str, str]]:

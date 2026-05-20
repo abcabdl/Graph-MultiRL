@@ -38,7 +38,7 @@ def build_event_graph(
     unique_nodes: dict[str, EventNode] = {}
     for node in nodes:
         unique_nodes.setdefault(node.node_id, node)
-    sorted_nodes = sorted(unique_nodes.values(), key=lambda node: (node.time_step, node.node_id))
+    sorted_nodes = sorted(unique_nodes.values(), key=_node_order_key)
     edges: list[EventEdge] = []
 
     def add_edge(source_node_id: str, target_node_id: str, edge_type: str, edge_id: str) -> None:
@@ -109,6 +109,19 @@ def lexical_overlap(left: str, right: str) -> float:
 
 def _tokens(text: str) -> list[str]:
     return [token.strip(".,;:!?()[]{}<>\"'`").lower() for token in (text or "").split()]
+
+
+def node_order_key(node: EventNode) -> tuple[int, int, str]:
+    return _node_order_key(node)
+
+
+def _node_order_key(node: EventNode) -> tuple[int, int, str]:
+    sample_index = node.metadata.get("sample_index", None)
+    try:
+        order_index = int(sample_index)
+    except (TypeError, ValueError):
+        order_index = 0
+    return (int(node.time_step), order_index, node.node_id)
 
 
 def extract_math_answer(text: str | None) -> str | None:

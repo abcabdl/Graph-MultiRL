@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from graphcredit_offline.core.graph_builder import lexical_overlap
+from graphcredit_offline.core.graph_builder import extract_math_answer, lexical_overlap
 from graphcredit_offline.core.schema import EventGraph, EventNode
 from graphcredit_offline.rewards.process_scorers import clip01
 
@@ -21,13 +21,17 @@ def cost_penalty(node: EventNode, token_budget: int = 512, min_useful_tokens: in
 def redundancy_penalty(graph: EventGraph, node: EventNode, counterfactual_credit: float, usage_score: float, cost: float) -> float:
     """Flag costly nodes whose removal appears to change little."""
 
+    node_answer = extract_math_answer(node.output_content)
     duplicate = any(
         other.node_id != node.node_id
         and other.agent_id == node.agent_id
         and other.time_step <= node.time_step
-        and lexical_overlap(other.output_content, node.output_content) > 0.85
+        and (
+            lexical_overlap(other.output_content, node.output_content) > 0.85
+            or (node_answer is not None and extract_math_answer(other.output_content) == node_answer)
+        )
         for other in graph.nodes
     )
-    if abs(counterfactual_credit) <= 0.05 and usage_score < 0.2 and (cost > 0.5 or duplicate):
+    if abs(counterfactual_credit) <= 0.05 and usage_score < 0.25 and (cost > 0.25 or duplicate):
         return 1.0
     return 0.0

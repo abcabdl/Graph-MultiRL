@@ -6,6 +6,7 @@ from graphcredit_offline.core.graph_builder import extract_math_answer
 from graphcredit_offline.core.schema import EventGraph, EventNode
 from graphcredit_offline.rewards.format_scorer import format_score
 from graphcredit_offline.rewards.process_scorers import ProcessScore, clip01
+from graphcredit_offline.rewards.verifier_diagnostics import math_verifier_diagnostics
 
 
 _EMPTY_BOXED_RE = re.compile(r"\\boxed\s*\{\s*\}")
@@ -29,26 +30,23 @@ class MathProcessScorer:
             score = 0.8 * final_reward + 0.2 * fmt
             reason = "final answer combines correctness and required answer format"
         elif node.node_type == "verifier_judgment":
-            approves = "<verify>approve</verify>" in output.lower()
-            rejects = "<verify>reject</verify>" in output.lower()
-            explained = _has_verifier_explanation(output)
-            if approves and final_reward > 0 and explained:
-                score = 0.3
-            elif rejects and final_reward <= 0 and explained:
-                score = 0.2
-            else:
-                score = 0.0
-            reason = "verifier score requires an explained verdict that agrees with final outcome"
+            diagnostics = math_verifier_diagnostics(graph, node)
+            score = max(0.0, diagnostics.verifier_reward)
+            reason = diagnostics.reason
         else:
             if _is_too_short(output) and final_reward <= 0:
                 score = 0.0
                 reason = "too-short incorrect solver output receives no process reward"
             else:
                 has_math = _has_math_structure(output)
-                score = 0.15 * fmt + 0.2 * length_score + 0.2 * non_repetitive + 0.2 * final_reward + 0.25 * float(has_math)
                 if final_reward <= 0:
-                    score = min(score, 0.35)
-                reason = "solver score uses nontrivial math structure and final success, with failed outputs capped"
+                    has_boxed_answer = extract_math_answer(output) is not None
+                    score = 0.10 * fmt + 0.10 * length_score + 0.10 * non_repetitive + 0.15 * float(has_math)
+                    score = min(score, 0.20 if has_boxed_answer else 0.25)
+                    reason = "failed solver output receives only capped local structure credit"
+                else:
+                    score = 0.15 * fmt + 0.2 * length_score + 0.2 * non_repetitive + 0.2 * final_reward + 0.25 * float(has_math)
+                    reason = "solver score uses nontrivial math structure and final success"
         return ProcessScore(node_id=node.node_id, score=clip01(score), reason=reason)
 
 
@@ -80,8 +78,3 @@ def _has_math_structure(text: str) -> bool:
     has_answer = extract_math_answer(output) is not None
     has_work = any(marker in output for marker in ["=", "$", "\\frac", "\\sqrt", "therefore", "Thus", "So"])
     return has_answer and has_work and not _is_too_short(output)
-
-
-def _has_verifier_explanation(text: str) -> bool:
-    cleaned = re.sub(r"<verify>\s*(approve|reject)\s*</verify>", "", text or "", flags=re.IGNORECASE).strip()
-    return len(cleaned.split()) >= 4

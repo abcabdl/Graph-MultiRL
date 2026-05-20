@@ -16,5 +16,5 @@ def downstream_usage_score(graph: EventGraph, node: EventNode) -> float:
         sum(1 for edge in graph.edges if edge.source_node_id == node.node_id and edge.edge_type in {"communication_edge", "evidence_edge"}) / 3.0,
         1.0,
     )
-    final_overlap = lexical_overlap(node.output_content, graph.final_answer or "")
+    final_overlap = lexical_overlap(node.output_content, graph.final_answer or "") if float(graph.final_reward or node.final_reward or 0.0) > 0.0 else 0.0
     return clip01(0.4 * direct_reference + 0.3 * path_score + 0.3 * final_overlap)

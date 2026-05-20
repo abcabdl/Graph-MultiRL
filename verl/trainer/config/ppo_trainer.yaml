@@ -272,7 +272,8 @@ graphcredit:
     delta_downstream_usage: 0.10
     eta_cost: 0.005
     zeta_redundancy: 0.02
-    failure_penalty: 0.02
+    failure_penalty: 0.08
+    failed_positive_cap: 0.05
   role_reward_weights:
     solver:
       alpha_global: 0.30
@@ -284,15 +285,15 @@ graphcredit:
       beta_process: 0.20
       gamma_counterfactual: 0.03
       delta_downstream_usage: 0.05
-  allow_failed_positive_node_reward: True
+  allow_failed_positive_node_reward: False
   counterfactual:
     mode: offline_masking
-    negative_credit_clip: -0.10
-    failed_negative_credit_clip: -0.10
+    negative_credit_clip: -0.25
+    failed_negative_credit_clip: -0.25
   normalization:
     mode: agent_node_type # global | agent | node_type | agent_node_type
   cost:
-    token_budget: 512
+    token_budget: 384
 
 trainer:
   balance_batch: True

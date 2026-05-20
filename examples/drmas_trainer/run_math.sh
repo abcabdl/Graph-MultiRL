@@ -1,6 +1,10 @@
 set -x
 
 MODE=${1:-train}
+if [ $# -gt 0 ]; then
+    shift
+fi
+
 if [ "$MODE" == "eval" ] || [ "$MODE" == "evaluation" ]; then
     echo "Running in evaluation mode"
     VAL_ONLY=True
@@ -93,8 +97,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="$experiment_name" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
+    trainer.save_freq=50 \
     trainer.test_freq=10 \
     trainer.total_epochs=2 \
     trainer.val_only=$VAL_ONLY \
-    trainer.val_before_train=True
+    trainer.val_before_train=True \
+    "$@"
