@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 
-from graphcredit_offline.core.graph_builder import extract_math_answer, lexical_overlap
+from graphcredit_offline.core.graph_builder import extract_math_answer, is_answer_node_type, is_solver_node_type, is_verifier_node_type, lexical_overlap
 from graphcredit_offline.core.schema import EventGraph, EventNode
 from graphcredit_offline.rewards.downstream_usage import downstream_usage_score
 from graphcredit_offline.rewards.process_scorers import clip01
@@ -24,26 +24,24 @@ class CounterfactualResult:
 MASK_BY_NODE_TYPE = {
     "agent_message": "[MESSAGE_REMOVED]",
     "agent_action": "[ACTION_REMOVED]",
+    "solver_reasoning": "[SOLVER_REASONING_REMOVED]",
+    "solver_final_answer": "[SOLVER_FINAL_ANSWER_REMOVED]",
     "tool_call": "[TOOL_CALL_REMOVED]",
     "tool_result": "[TOOL_RESULT_UNAVAILABLE]",
     "router_decision": "[ROUTER_DECISION_REMOVED]",
     "verifier_judgment": "[NEUTRAL_VERIFIER_JUDGMENT]",
+    "verifier_check": "[NEUTRAL_VERIFIER_CHECK]",
+    "verifier_correction": "[NEUTRAL_VERIFIER_CORRECTION]",
     "memory_write": "[MEMORY_WRITE_REMOVED]",
     "memory_read": "[MEMORY_READ_EMPTY]",
 }
 
 
 def offline_masking_credit(graph: EventGraph, node: EventNode, process_reward: float = 0.0, task_type: str | None = None) -> CounterfactualResult:
-    """Estimate SHARP-style marginal contribution on a statically masked graph.
-
-    This follows the form R(original_graph) - R(masked_graph) while avoiding
-    LLM/environment reruns. The masked graph value is recomputed by task-specific
-    offline rules over graph support, evidence, router decisions, and verifier
-    judgments.
-    """
+    """Estimate SHARP-style marginal contribution on a statically masked graph."""
 
     original_value = float(graph.final_reward or node.final_reward or 0.0)
-    if node.node_type == "final_answer":
+    if is_answer_node_type(node.node_type):
         return CounterfactualResult(node.node_id, original_value, original_value, 0.0, "final_answer is evaluated, not masked")
     masked_graph = mask_node(graph, node.node_id)
     masked_value = evaluate_masked_graph(masked_graph, original_graph=graph, masked_node=node, process_reward=process_reward, task_type=task_type)
@@ -96,20 +94,20 @@ def evaluate_masked_graph(
 
 def _evaluate_math_masked_graph(masked_graph: EventGraph, original_graph: EventGraph, masked_node: EventNode, process_reward: float) -> float:
     original_value = float(original_graph.final_reward or masked_node.final_reward or 0.0)
-    if masked_node.node_type == "verifier_judgment":
+    if is_verifier_node_type(masked_node.node_type):
         diagnostics = math_verifier_diagnostics(original_graph, masked_node)
         return original_value - diagnostics.verifier_reward
 
     support = _final_answer_support(masked_graph)
     usage_before = downstream_usage_score(original_graph, masked_node)
     if original_value > 0:
-        if masked_node.node_type in {"agent_message", "agent_action"}:
+        if is_solver_node_type(masked_node.node_type):
             support_floor = 0.25 if _has_unmasked_solver_support(masked_graph, original_graph.final_answer) else 0.0
             return clip01(max(support, support_floor))
         return clip01(max(support, 1.0 - 0.7 * usage_before))
 
     harmful = clip01(1.0 - process_reward)
-    if masked_node.node_type in {"agent_message", "agent_action"}:
+    if is_solver_node_type(masked_node.node_type):
         has_boxed_answer = extract_math_answer(masked_node.output_content) is not None
         misleading_answer = 0.35 if has_boxed_answer else 0.0
         if has_boxed_answer or usage_before > 0.1:
@@ -148,14 +146,13 @@ def _final_answer_support(graph: EventGraph) -> float:
         target_answer = extract_math_answer(final_answer)
         if target_answer is not None:
             answer_match = any(
-                node.node_type in {"agent_message", "agent_action"}
-                and extract_math_answer(node.output_content) == target_answer
+                is_solver_node_type(node.node_type) and extract_math_answer(node.output_content) == target_answer
                 for node in supporting_nodes
             )
             if answer_match:
                 return 1.0
             overlap = max(
-                (lexical_overlap(node.output_content, final_answer) for node in supporting_nodes if node.node_type in {"agent_message", "agent_action"}),
+                (lexical_overlap(node.output_content, final_answer) for node in supporting_nodes if is_solver_node_type(node.node_type)),
                 default=0.0,
             )
             return clip01(0.3 * overlap)
@@ -168,7 +165,7 @@ def _final_answer_support(graph: EventGraph) -> float:
 def _has_unmasked_solver_support(graph: EventGraph, final_answer: str | None = None) -> bool:
     target_answer = extract_math_answer(final_answer)
     return any(
-        node.node_type in {"agent_message", "agent_action"}
+        is_solver_node_type(node.node_type)
         and not node.metadata.get("masked", False)
         and (
             (target_answer is not None and extract_math_answer(node.output_content) == target_answer)

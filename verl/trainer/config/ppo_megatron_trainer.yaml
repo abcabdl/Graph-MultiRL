@@ -291,6 +291,12 @@ algorithm:
 graphcredit:
   enabled: False
   task_type: ${agent.orchestra_type}
+  reward_mode: fusion # fusion | outcome_redistribution
+  outcome_redistribution:
+    train_roles: [] # e.g. ["Solver Agent"]; empty means all roles
+    failed_node_reward: 0.0
+    success_reward_scale: 1.0
+    credit_basis: counterfactual # counterfactual | process | counterfactual_process | uniform
   logging:
     save_event_graphs: False
     output_path: outputs/graphcredit_event_graphs.jsonl

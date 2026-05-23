@@ -7,6 +7,30 @@ from graphcredit_offline.core.schema import EventEdge, EventGraph, EventNode
 
 _BOXED_RE = re.compile(r"\\boxed\s*\{([^{}]+)\}")
 _EMPTY_BOXED_RE = re.compile(r"\\boxed\s*\{\s*\}")
+_REASONING_MARKERS = (
+    "therefore",
+    "thus",
+    "because",
+    "step ",
+    "let's",
+    "consider",
+    "we can",
+    "hence",
+    "coordinate",
+    "distance formula",
+    "substitute",
+    "compute",
+)
+_VERIFIER_CORRECTION_MARKERS = (
+    "correct answer",
+    "should be",
+    "instead",
+    "the answer is",
+    "we get",
+    "therefore the answer",
+    "revise",
+    "correction",
+)
 
 
 def infer_node_type(agent_id: str | None, output_content: str = "", orchestra_type: str | None = None) -> str:
@@ -19,10 +43,38 @@ def infer_node_type(agent_id: str | None, output_content: str = "", orchestra_ty
     if "answer agent" in agent or "<answer>" in output:
         return "final_answer"
     if "verifier agent" in agent:
-        return "router_decision" if orchestra_type == "search" else "verifier_judgment"
+        if orchestra_type == "search":
+            return "router_decision"
+        return "verifier_correction" if _looks_like_verifier_correction(output) else "verifier_check"
     if "solver agent" in agent:
-        return "agent_message"
+        return _solver_subtype(output)
     return "agent_action"
+
+
+def refine_node_type(
+    node_type: str | None,
+    agent_id: str | None,
+    output_content: str = "",
+    orchestra_type: str | None = None,
+) -> str:
+    """Refine a coarse node type into a task-aware subtype when possible."""
+
+    base = _normalize_node_type(node_type)
+    agent = (agent_id or "").lower()
+    output = (output_content or "").lower()
+    if base in {"tool_call", "tool_result", "router_decision", "final_answer", "memory_write", "memory_read"}:
+        return base
+    if base in {"verifier_judgment", "verifier_check", "verifier_correction"} or "verifier agent" in agent:
+        if orchestra_type == "search":
+            return "router_decision"
+        return "verifier_correction" if _looks_like_verifier_correction(output) else "verifier_check"
+    if base in {"agent_message", "agent_action", "solver_reasoning", "solver_final_answer"} or "solver agent" in agent:
+        return _solver_subtype(output)
+    if "search agent" in agent or "<search>" in output:
+        return "tool_call"
+    if "answer agent" in agent or "<answer>" in output:
+        return "final_answer"
+    return base or "agent_action"
 
 
 def build_event_graph(
@@ -77,7 +129,7 @@ def build_event_graph(
                     "communication_edge",
                     f"{trajectory_id}:communication:{src.node_id}:{dst.node_id}",
                 )
-            if dst.node_type == "final_answer" and lexical_overlap(src.output_content, dst.output_content) > 0.15:
+            if _is_answer_node_type(dst.node_type) and lexical_overlap(src.output_content, dst.output_content) > 0.15:
                 add_edge(
                     src.node_id,
                     dst.node_id,
@@ -136,17 +188,17 @@ def extract_math_answer(text: str | None) -> str | None:
 def _select_final_answer(nodes: list[EventNode], task_type: str) -> str | None:
     if task_type.lower() == "math":
         for node in reversed(nodes):
-            if node.node_type == "final_answer":
+            if _is_answer_node_type(node.node_type):
                 answer = extract_math_answer(node.output_content)
                 if answer is not None:
                     return f"\\boxed{{{answer}}}"
         for node in reversed(nodes):
-            if node.node_type in {"agent_message", "agent_action"}:
+            if _is_solver_node_type(node.node_type):
                 answer = extract_math_answer(node.output_content)
                 if answer is not None:
                     return f"\\boxed{{{answer}}}"
         for node in reversed(nodes):
-            if node.node_type not in {"verifier_judgment", "router_decision"} and _has_meaningful_math_output(node.output_content):
+            if not _is_verifier_node_type(node.node_type) and _has_meaningful_math_output(node.output_content):
                 return node.output_content
         return None
 
@@ -163,3 +215,57 @@ def _normalize_answer(answer: str) -> str:
 def _has_meaningful_math_output(text: str | None) -> bool:
     output = (text or "").strip()
     return bool(output) and not _EMPTY_BOXED_RE.fullmatch(output)
+
+
+def _normalize_node_type(node_type: str | None) -> str:
+    return str(node_type or "").strip().lower().replace(" ", "_")
+
+
+def is_answer_node_type(node_type: str | None) -> bool:
+    return _is_answer_node_type(node_type)
+
+
+def is_solver_node_type(node_type: str | None) -> bool:
+    return _is_solver_node_type(node_type)
+
+
+def is_solver_reasoning_node_type(node_type: str | None) -> bool:
+    return _normalize_node_type(node_type) in {"agent_message", "agent_action", "solver_reasoning"}
+
+
+def is_verifier_node_type(node_type: str | None) -> bool:
+    return _is_verifier_node_type(node_type)
+
+
+def _is_answer_node_type(node_type: str | None) -> bool:
+    return _normalize_node_type(node_type) in {"final_answer", "solver_final_answer"}
+
+
+def _is_solver_node_type(node_type: str | None) -> bool:
+    return _normalize_node_type(node_type) in {"agent_message", "agent_action", "solver_reasoning", "solver_final_answer"}
+
+
+def _is_verifier_node_type(node_type: str | None) -> bool:
+    return _normalize_node_type(node_type) in {"verifier_judgment", "verifier_check", "verifier_correction", "router_decision"}
+
+
+def _looks_like_reasoning(output: str) -> bool:
+    text = (output or "").lower()
+    return len(text.split()) >= 18 or any(marker in text for marker in _REASONING_MARKERS)
+
+
+def _looks_like_math_final_answer(output: str) -> bool:
+    return extract_math_answer(output) is not None or "<answer>" in (output or "").lower()
+
+
+def _looks_like_verifier_correction(output: str) -> bool:
+    text = (output or "").lower()
+    return _looks_like_math_final_answer(output) or any(marker in text for marker in _VERIFIER_CORRECTION_MARKERS)
+
+
+def _solver_subtype(output: str) -> str:
+    if _looks_like_math_final_answer(output):
+        word_count = len((output or "").split())
+        if word_count <= 24:
+            return "solver_final_answer"
+    return "solver_reasoning"

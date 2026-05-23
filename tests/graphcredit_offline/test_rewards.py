@@ -1,8 +1,9 @@
 from collections import UserDict
 
-from graphcredit_offline.core.graph_builder import build_event_graph
+from graphcredit_offline.core.graph_builder import build_event_graph, refine_node_type
 from graphcredit_offline.core.schema import EventNode
-from graphcredit_offline.integration import _weights_for_node
+from graphcredit_offline.integration import _apply_outcome_redistribution, _weights_for_node
+from graphcredit_offline.rewards.fusion import RewardBreakdown
 from graphcredit_offline.rewards.counterfactual import offline_masking_credit
 from graphcredit_offline.rewards.cost import cost_penalty, redundancy_penalty
 from graphcredit_offline.rewards.downstream_usage import downstream_usage_score
@@ -258,6 +259,92 @@ def test_failed_trajectory_can_keep_capped_positive_verified_local_credit():
     assert 0.0 < breakdown.node_reward <= 0.05
 
 
+def test_outcome_redistribution_zeros_failed_local_credit():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="structured but wrong solution \\boxed{999}",
+        final_reward=0.0,
+    )
+    graph = build_event_graph("t1", [solver], task_type="math", final_reward=0.0)
+    breakdown = RewardBreakdown(
+        node_id="solver",
+        global_reward=0.0,
+        process_reward=0.8,
+        counterfactual_credit=0.4,
+        downstream_usage_score=0.5,
+        cost_penalty=0.0,
+        redundancy_penalty=0.0,
+        node_reward=0.6,
+    )
+    pending = [{"node": solver, "graph": graph, "breakdown": breakdown}]
+
+    _apply_outcome_redistribution(
+        pending,
+        {
+            "outcome_redistribution": {
+                "train_roles": ["Solver Agent"],
+                "failed_node_reward": 0.0,
+                "credit_basis": "counterfactual_process",
+            }
+        },
+    )
+
+    assert breakdown.node_reward == 0.0
+    assert breakdown.details["pre_redistribution_node_reward"] == 0.6
+
+
+def test_outcome_redistribution_sends_success_reward_to_train_role_only():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="valid reasoning \\boxed{1}",
+        final_reward=1.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="solution",
+        output_content="<verify>approve</verify>",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=1.0)
+    solver_breakdown = RewardBreakdown("solver", 1.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.2)
+    verifier_breakdown = RewardBreakdown("verifier", 1.0, 0.9, 0.9, 0.0, 0.0, 0.0, 0.8)
+    pending = [
+        {"node": solver, "graph": graph, "breakdown": solver_breakdown},
+        {"node": verifier, "graph": graph, "breakdown": verifier_breakdown},
+    ]
+
+    _apply_outcome_redistribution(
+        pending,
+        {
+            "outcome_redistribution": {
+                "train_roles": ["Solver Agent"],
+                "success_reward_scale": 1.0,
+                "credit_basis": "counterfactual_process",
+            }
+        },
+    )
+
+    assert solver_breakdown.node_reward == 1.0
+    assert verifier_breakdown.node_reward == 0.0
+
+
 def test_verifier_rejecting_correct_solver_answer_gets_negative_counterfactual_credit():
     solver = EventNode(
         node_id="solver",
@@ -308,10 +395,10 @@ def test_verifier_correction_gain_uses_sample_index_when_time_step_ties():
         trajectory_id="t1",
         agent_id="Verifier Agent",
         role="verifier",
-        node_type="verifier_judgment",
+        node_type="verifier_correction",
         time_step=1,
         input_context="first try gives \\boxed{9}",
-        output_content="<verify>reject</verify> the arithmetic sign is inconsistent",
+        output_content="<verify>reject</verify> the arithmetic sign is inconsistent; the corrected answer should be \\boxed{1}",
         final_reward=1.0,
         metadata={"sample_index": 1},
     )
@@ -332,8 +419,8 @@ def test_verifier_correction_gain_uses_sample_index_when_time_step_ties():
     process = MathProcessScorer().score(graph, verifier)
     cf = offline_masking_credit(graph, verifier, process_reward=process.score, task_type="math")
 
-    assert process.score == 0.5
-    assert cf.credit == 0.5
+    assert process.score > 0.5
+    assert cf.credit == 0.7
 
 
 def test_failed_downstream_usage_ignores_overlap_with_wrong_final_answer():
@@ -394,6 +481,93 @@ def test_role_reward_weights_accept_nested_mapping_configs():
 
     assert weights["beta_process"] == 0.35
     assert weights["delta_downstream_usage"] == 0.10
+
+
+def test_refine_node_type_distinguishes_solver_and_verifier_subtypes():
+    reasoning = refine_node_type("agent_message", "Solver Agent", "Step 1: therefore x = 2", "math")
+    final_answer = refine_node_type("agent_message", "Solver Agent", "Thus \\boxed{2}", "math")
+    verifier_check = refine_node_type("verifier_judgment", "Verifier Agent", "<verify>reject</verify> explanation", "math")
+    verifier_correction = refine_node_type("verifier_judgment", "Verifier Agent", "<verify>reject</verify> the correct answer should be \\boxed{2}", "math")
+
+    assert reasoning == "solver_reasoning"
+    assert final_answer == "solver_final_answer"
+    assert verifier_check == "verifier_check"
+    assert verifier_correction == "verifier_correction"
+
+
+def test_verifier_approve_wrong_answer_is_penalized_more_than_reject_with_correction():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="bad step \\boxed{999}",
+        final_reward=0.0,
+    )
+    verifier_wrong = EventNode(
+        node_id="verifier_wrong",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="bad step \\boxed{999}",
+        output_content="<verify>approve</verify> looks fine",
+        final_reward=0.0,
+    )
+    verifier_good = EventNode(
+        node_id="verifier_good",
+        trajectory_id="t2",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_correction",
+        time_step=2,
+        input_context="bad step \\boxed{999}",
+        output_content="<verify>reject</verify> the correct answer should be \\boxed{1}",
+        final_reward=1.0,
+    )
+    graph_wrong = build_event_graph("t1", [solver, verifier_wrong], task_type="math", final_reward=0.0)
+    graph_good = build_event_graph("t2", [solver, verifier_good], task_type="math", final_reward=1.0)
+
+    wrong = MathProcessScorer().score(graph_wrong, verifier_wrong).score
+    good = MathProcessScorer().score(graph_good, verifier_good).score
+
+    assert wrong < 0.05
+    assert good >= wrong
+
+
+def test_solver_reasoning_length_is_not_capped_too_early():
+    short = EventNode(
+        node_id="short",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="x = 1 \\boxed{1}",
+        final_reward=1.0,
+    )
+    long = EventNode(
+        node_id="long",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="Step 1: consider the equation carefully. Step 2: substitute the values. Step 3: therefore the result follows. We continue the derivation until the boxed answer is justified. x = 1 so we get \\boxed{1}",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [short, long], task_type="math", final_reward=1.0)
+
+    short_score = MathProcessScorer().score(graph, short).score
+    long_score = MathProcessScorer().score(graph, long).score
+
+    assert long_score >= short_score
 
 
 def test_too_short_solver_output_has_high_cost_penalty():

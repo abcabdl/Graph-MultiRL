@@ -45,39 +45,47 @@ def math_verifier_diagnostics(graph: EventGraph, node: EventNode) -> VerifierDia
     next_solver = _nearest_solver_after(graph, node)
     previous_answer = extract_math_answer(previous_solver.output_content) if previous_solver else None
     next_answer = extract_math_answer(next_solver.output_content) if next_solver else None
+    verifier_answer = extract_math_answer(node.output_content)
     final_answer = extract_math_answer(graph.final_answer)
     final_success = float(graph.final_reward or node.final_reward or 0.0) > 0.0
     before_correct = bool(final_success and previous_answer is not None and previous_answer == final_answer)
-    after_correct = bool(final_success and (next_answer == final_answer or (next_answer is None and previous_answer == final_answer)))
+    after_correct = bool(
+        final_success
+        and (
+            next_answer == final_answer
+            or verifier_answer == final_answer
+            or (next_answer is None and previous_answer == final_answer)
+        )
+    )
     answer_changed = bool(previous_answer is not None and next_answer is not None and previous_answer != next_answer)
     correction_gain = float(after_correct) - float(before_correct)
 
     reward = 0.0
     reason = "verifier did not provide an actionable verified correction"
     if verdict == "approve" and before_correct and explained:
-        reward = 0.4
+        reward = 0.45
         reason = "verifier approved a correct prior solver answer"
     elif verdict == "reject" and correction_gain > 0.0 and explained:
-        reward = 0.5
+        reward = 0.7 if after_correct else 0.5
         reason = "verifier rejected a wrong prior answer and the next answer became correct"
     elif verdict == "reject" and before_correct:
-        reward = -0.4
+        reward = -0.6
         reason = "verifier rejected a correct prior solver answer"
     elif verdict == "approve" and not before_correct:
-        reward = -0.5
+        reward = -0.8
         reason = "verifier approved an unverified or wrong prior solver answer"
     elif verdict == "reject" and not final_success and explained and (previous_answer is not None or answer_changed):
-        reward = 0.1
+        reward = 0.15 if answer_changed else 0.08
         reason = "verifier rejected a failed trajectory answer but did not produce a verified correction"
     elif verdict == "reject" and explained:
-        reward = 0.0
+        reward = 0.02 if answer_changed else 0.0
         reason = "verifier rejection had explanation but no verified correction gain"
 
     return VerifierDiagnostics(
         verdict=verdict,
         explained=explained,
         previous_answer=previous_answer,
-        next_answer=next_answer,
+        next_answer=verifier_answer or next_answer,
         final_answer=final_answer,
         before_correct=before_correct,
         after_correct=after_correct,

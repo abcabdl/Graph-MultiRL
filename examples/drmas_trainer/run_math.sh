@@ -37,7 +37,9 @@ orchestra_type=math
 max_loop_num=2
 
 # Agent-specific parameter override (only support actor_rollout_ref)
-actor_optim_lr='[1e-6,1e-6]'
+
+# actor_optim_lr='[1e-6,1e-6]'
+actor_optim_lr='[1e-6,2e-7]'
 actor_ppo_micro_batch_size_per_gpu='[4,4]'
 
 model_name_tag=$(jq -r '.[]' <<< "$model_ids"  | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]' | tr '-' '_' | paste -sd_)

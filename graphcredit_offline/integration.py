@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from graphcredit_offline.core.graph_builder import build_event_graph, infer_node_type
+from graphcredit_offline.core.graph_builder import build_event_graph, infer_node_type, refine_node_type
 from graphcredit_offline.core.schema import EventNode
 from graphcredit_offline.core.serialization import append_graph_jsonl
 from graphcredit_offline.eval.metrics import harmful_node_ratio, redundant_node_ratio, reward_variance
@@ -53,6 +53,7 @@ def apply_graphcredit_rewards(
     graph_path = gc_config.get("logging", {}).get("output_path", "outputs/graphcredit_event_graphs.jsonl")
     save_node_rewards = bool(gc_config.get("logging", {}).get("save_node_rewards", False))
     node_reward_path = gc_config.get("logging", {}).get("node_reward_output_path", "outputs/graphcredit_node_rewards.jsonl")
+    reward_mode = str(gc_config.get("reward_mode", "fusion"))
 
     decoded = _decode_batch(data, tokenizers)
     graph_by_traj = _build_graphs(data, decoded, reward_tensor, task_type, orchestra_type)
@@ -71,6 +72,7 @@ def apply_graphcredit_rewards(
         "graphcredit_breakdown_json": [],
     }
     breakdowns: list[RewardBreakdown] = []
+    pending_items: list[dict[str, Any]] = []
     node_reward_records: list[dict[str, Any]] = []
     for i in range(len(data)):
         item = data[i]
@@ -87,7 +89,7 @@ def apply_graphcredit_rewards(
         cost = _failed_math_solver_cost_floor(task_type, global_reward, node, cost)
         redundant = redundancy_penalty(graph, node, cf.credit, usage, cost)
         node_weights = _weights_for_node(weights, role_weights, node)
-        verifier_diagnostics = math_verifier_diagnostics(graph, node) if task_type == "math" and node.node_type == "verifier_judgment" else None
+        verifier_diagnostics = math_verifier_diagnostics(graph, node) if task_type == "math" and node.node_type in {"verifier_judgment", "verifier_check", "verifier_correction"} else None
         training_cf_credit = cf.credit
         if global_reward <= 0.0:
             training_cf_credit = max(training_cf_credit, failed_negative_clip)
@@ -115,6 +117,30 @@ def apply_graphcredit_rewards(
         )
         breakdowns.append(breakdown)
         valid_response_length = int(item.batch["attention_mask"][item.batch["prompts"].shape[-1] :].sum().item())
+        pending_items.append(
+            {
+                "index": i,
+                "valid_response_length": valid_response_length,
+                "node": node,
+                "graph": graph,
+                "nt": nt,
+                "breakdown": breakdown,
+            }
+        )
+
+    if reward_mode == "outcome_redistribution":
+        _apply_outcome_redistribution(pending_items, gc_config)
+    elif reward_mode != "fusion":
+        raise ValueError(f"Unsupported graphcredit.reward_mode={reward_mode!r}. Expected 'fusion' or 'outcome_redistribution'.")
+
+    for pending in pending_items:
+        i = pending["index"]
+        valid_response_length = pending["valid_response_length"]
+        node = pending["node"]
+        graph = pending["graph"]
+        nt = pending["nt"]
+        breakdown = pending["breakdown"]
+        traj_uid = str(nt.get("traj_uid", nt.get("uid", "trajectory")))
         if valid_response_length > 0:
             new_reward[i, valid_response_length - 1] = torch.tensor(breakdown.node_reward, dtype=torch.float32, device=new_reward.device)
         extras["graphcredit_node_reward"].append(breakdown.node_reward)
@@ -168,7 +194,127 @@ def apply_graphcredit_rewards(
         "graphcredit/redundant_node_ratio": redundant_node_ratio(breakdowns),
         "graphcredit/node_reward_mean": float(np.mean([item.node_reward for item in breakdowns])) if breakdowns else 0.0,
     }
+    metrics.update(_outcome_reward_metrics(pending_items, reward_mode))
     return new_reward, extras, metrics
+
+
+def _apply_outcome_redistribution(pending_items: list[dict[str, Any]], gc_config: dict[str, Any]) -> None:
+    """Conservatively redistribute final outcome reward across eligible graph nodes.
+
+    This mode keeps final correctness as the reward anchor: failed trajectories do
+    not receive positive node rewards, and successful trajectories only split the
+    observed final reward among selected roles. Process/counterfactual scores are
+    used only as allocation weights, not as independent reward sources.
+    """
+
+    outcome_cfg = _to_plain_container(gc_config.get("outcome_redistribution", {}))
+    train_roles = outcome_cfg.get("train_roles", gc_config.get("train_roles", [])) or []
+    failed_node_reward = float(outcome_cfg.get("failed_node_reward", 0.0))
+    success_reward_scale = float(outcome_cfg.get("success_reward_scale", 1.0))
+    credit_basis = str(outcome_cfg.get("credit_basis", "counterfactual"))
+    eps = 1e-8
+
+    by_traj: dict[str, list[dict[str, Any]]] = {}
+    for pending in pending_items:
+        graph = pending["graph"]
+        by_traj.setdefault(graph.trajectory_id, []).append(pending)
+
+    for traj_items in by_traj.values():
+        graph = traj_items[0]["graph"]
+        global_reward = float(graph.final_reward or 0.0)
+        eligible = [item for item in traj_items if _role_is_trainable(item["node"], train_roles)]
+
+        for item in traj_items:
+            breakdown = item["breakdown"]
+            breakdown.details["pre_redistribution_node_reward"] = breakdown.node_reward
+            breakdown.details["reward_mode"] = "outcome_redistribution"
+            breakdown.details["outcome_credit_basis"] = credit_basis
+            breakdown.details["outcome_train_roles"] = list(train_roles)
+
+        if global_reward <= 0.0 or not eligible:
+            for item in traj_items:
+                item["breakdown"].node_reward = failed_node_reward if item in eligible else 0.0
+            continue
+
+        credits = [_outcome_credit(item["breakdown"], credit_basis) for item in eligible]
+        credit_sum = sum(credits)
+        if credit_sum <= eps:
+            credits = [1.0 for _ in eligible]
+            credit_sum = float(len(eligible))
+
+        reward_mass = global_reward * success_reward_scale
+        for item in traj_items:
+            item["breakdown"].node_reward = 0.0
+        for item, credit in zip(eligible, credits, strict=True):
+            item["breakdown"].node_reward = float(reward_mass * credit / credit_sum)
+
+
+def _outcome_credit(breakdown: RewardBreakdown, credit_basis: str) -> float:
+    cf_credit = max(float(breakdown.counterfactual_credit), 0.0)
+    if credit_basis == "counterfactual":
+        return cf_credit
+    if credit_basis == "process":
+        return max(float(breakdown.process_reward), 0.0)
+    if credit_basis in {"counterfactual_process", "hybrid"}:
+        return cf_credit * max(float(breakdown.process_reward), 0.0)
+    if credit_basis == "uniform":
+        return 1.0
+    raise ValueError(
+        f"Unsupported graphcredit.outcome_redistribution.credit_basis={credit_basis!r}. "
+        "Expected counterfactual, process, counterfactual_process, hybrid, or uniform."
+    )
+
+
+def _role_is_trainable(node: EventNode, train_roles: list[str]) -> bool:
+    if not train_roles:
+        return True
+    trainable = {_normalize_key(str(role)) for role in train_roles}
+    candidates = {
+        _normalize_key(str(node.role or "")),
+        _normalize_key(str(node.agent_id or "")),
+        _normalize_key(str(node.node_type or "")),
+    }
+    return bool(trainable.intersection(candidates))
+
+
+def _outcome_reward_metrics(pending_items: list[dict[str, Any]], reward_mode: str) -> dict[str, float]:
+    if not pending_items:
+        return {}
+
+    rewards = [float(item["breakdown"].node_reward) for item in pending_items]
+    success_rewards = [
+        float(item["breakdown"].node_reward)
+        for item in pending_items
+        if float(item["graph"].final_reward or 0.0) > 0.0
+    ]
+    failed_rewards = [
+        float(item["breakdown"].node_reward)
+        for item in pending_items
+        if float(item["graph"].final_reward or 0.0) <= 0.0
+    ]
+    solver_rewards = [
+        float(item["breakdown"].node_reward)
+        for item in pending_items
+        if _normalize_key(str(item["node"].agent_id or item["node"].role or "")) == "solver"
+    ]
+    verifier_rewards = [
+        float(item["breakdown"].node_reward)
+        for item in pending_items
+        if _normalize_key(str(item["node"].agent_id or item["node"].role or "")) == "verifier"
+    ]
+
+    metrics = {
+        "graphcredit/outcome_reward_mode": 1.0 if reward_mode == "outcome_redistribution" else 0.0,
+        "graphcredit/success_node_reward_mean": float(np.mean(success_rewards)) if success_rewards else 0.0,
+        "graphcredit/failed_node_reward_mean": float(np.mean(failed_rewards)) if failed_rewards else 0.0,
+        "graphcredit/failed_positive_node_ratio": float(np.mean([reward > 0.0 for reward in failed_rewards])) if failed_rewards else 0.0,
+        "graphcredit/positive_node_ratio": float(np.mean([reward > 0.0 for reward in rewards])) if rewards else 0.0,
+    }
+    if solver_rewards:
+        metrics["graphcredit/solver_node_reward_mean"] = float(np.mean(solver_rewards))
+    if verifier_rewards:
+        metrics["graphcredit/verifier_node_reward_mean"] = float(np.mean(verifier_rewards))
+    return metrics
 
 
 def _append_jsonl(path: str, records: list[dict[str, Any]]) -> None:
@@ -265,7 +411,7 @@ def _build_graphs(data, decoded: list[tuple[str, str]], reward_tensor: torch.Ten
         traj_uid = str(nt.get("traj_uid", nt.get("uid", "trajectory")))
         agent_id = nt.get("agent_id", None)
         env_step = int(nt.get("env_step", 0))
-        node_type = str(nt.get("node_type", infer_node_type(agent_id, response, orchestra_type)))
+        node_type = refine_node_type(nt.get("node_type", infer_node_type(agent_id, response, orchestra_type)), agent_id, response, orchestra_type)
         node_id = str(nt.get("graphcredit_node_id", f"{traj_uid}:{env_step}:{agent_id}:{i}"))
         final_reward = float(nt.get("episode_rewards", reward_tensor[i].sum().detach().cpu().item()))
         prompts.setdefault(traj_uid, prompt)

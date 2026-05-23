@@ -18,9 +18,11 @@ def format_score(node_type: str, output: str) -> float:
     if node_type == "router_decision":
         low = text.lower()
         return 1.0 if "<verify>yes</verify>" in low or "<verify>no</verify>" in low else 0.0
-    if node_type == "verifier_judgment":
+    if node_type in {"verifier_judgment", "verifier_check", "verifier_correction"}:
         low = text.lower()
         return 1.0 if "<verify>approve</verify>" in low or "<verify>reject</verify>" in low else 0.0
-    if node_type == "final_answer":
+    if node_type in {"final_answer", "solver_final_answer"}:
         return 1.0 if ("<answer>" in text and "</answer>" in text) or "\\boxed" in text else 0.5
+    if node_type in {"solver_reasoning", "agent_message", "agent_action"}:
+        return 1.0 if text.strip() else 0.0
     return 1.0 if text.strip() else 0.0

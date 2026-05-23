@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from graphcredit_offline.core.graph_builder import lexical_overlap
+from graphcredit_offline.core.graph_builder import is_solver_node_type, lexical_overlap
 from graphcredit_offline.core.schema import EventGraph, EventNode
 from graphcredit_offline.rewards.process_scorers import clip01
 
@@ -17,4 +17,6 @@ def downstream_usage_score(graph: EventGraph, node: EventNode) -> float:
         1.0,
     )
     final_overlap = lexical_overlap(node.output_content, graph.final_answer or "") if float(graph.final_reward or node.final_reward or 0.0) > 0.0 else 0.0
+    if is_solver_node_type(node.node_type):
+        direct_reference = min(1.0, direct_reference + 0.2)
     return clip01(0.4 * direct_reference + 0.3 * path_score + 0.3 * final_overlap)
