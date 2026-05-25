@@ -297,6 +297,11 @@ graphcredit:
     failed_node_reward: 0.0
     success_reward_scale: 1.0
     credit_basis: counterfactual # counterfactual | process | counterfactual_process | uniform
+    solver_min_success_share: 0.55
+    verifier_max_success_share: 0.35
+    verifier_hard_penalty: True
+    verifier_negative_reward_scale: 0.25
+    redistribute_verifier_penalty_share: True
   logging:
     save_event_graphs: False
     output_path: outputs/graphcredit_event_graphs.jsonl

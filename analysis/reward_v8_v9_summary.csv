@@ -1,0 +1,9 @@
+run,metric,mean_step_1_50,mean_step_401_450,mean_last_50_available
+V8 solver-only train_roles,episode/reward/mean,0.43754,0.54498,0.5637599999999999
+V8 solver-only train_roles,graphcredit/node_reward_mean,0.15353999999999998,0.18446,0.19006
+V8 solver-only train_roles,graphcredit/solver_node_reward_mean,0.24187999999999998,0.28056000000000003,0.28809999999999997
+V8 solver-only train_roles,graphcredit/verifier_node_reward_mean,0.0,0.0,0.0
+V9 solver+verifier train_roles,episode/reward/mean,0.44998,0.55878,0.39124000000000003
+V9 solver+verifier train_roles,graphcredit/node_reward_mean,0.153,0.18628,0.13046
+V9 solver+verifier train_roles,graphcredit/solver_node_reward_mean,0.22899999999999998,0.24312,0.06194
+V9 solver+verifier train_roles,graphcredit/verifier_node_reward_mean,0.00954,0.07244,0.26724

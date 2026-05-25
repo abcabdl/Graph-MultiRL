@@ -9,8 +9,10 @@ import numpy as np
 import torch
 
 from graphcredit_offline.core.graph_builder import build_event_graph, infer_node_type, refine_node_type
+from graphcredit_offline.core.graph_builder import is_solver_node_type, is_verifier_node_type
 from graphcredit_offline.core.schema import EventNode
 from graphcredit_offline.core.serialization import append_graph_jsonl
+from graphcredit_offline.core.text_sanitize import sanitize_text
 from graphcredit_offline.eval.metrics import harmful_node_ratio, redundant_node_ratio, reward_variance
 from graphcredit_offline.rewards.cost import cost_penalty, redundancy_penalty
 from graphcredit_offline.rewards.counterfactual import offline_masking_credit
@@ -178,7 +180,7 @@ def apply_graphcredit_rewards(
                 "applied_weights": breakdown.details.get("applied_weights", {}),
                 "verifier_diagnostics": breakdown.details.get("verifier_diagnostics", {}),
                 "final_answer": graph.final_answer,
-                "output_content": node.output_content,
+                "output_content": sanitize_text(node.output_content),
             }
         )
 
@@ -212,7 +214,11 @@ def _apply_outcome_redistribution(pending_items: list[dict[str, Any]], gc_config
     failed_node_reward = float(outcome_cfg.get("failed_node_reward", 0.0))
     success_reward_scale = float(outcome_cfg.get("success_reward_scale", 1.0))
     credit_basis = str(outcome_cfg.get("credit_basis", "counterfactual"))
-    eps = 1e-8
+    solver_min_success_share = float(outcome_cfg.get("solver_min_success_share", 0.55))
+    verifier_max_success_share = float(outcome_cfg.get("verifier_max_success_share", 0.35))
+    verifier_hard_penalty = bool(outcome_cfg.get("verifier_hard_penalty", True))
+    verifier_negative_reward_scale = float(outcome_cfg.get("verifier_negative_reward_scale", 0.25))
+    redistribute_verifier_penalty_share = bool(outcome_cfg.get("redistribute_verifier_penalty_share", True))
 
     by_traj: dict[str, list[dict[str, Any]]] = {}
     for pending in pending_items:
@@ -234,19 +240,120 @@ def _apply_outcome_redistribution(pending_items: list[dict[str, Any]], gc_config
         if global_reward <= 0.0 or not eligible:
             for item in traj_items:
                 item["breakdown"].node_reward = failed_node_reward if item in eligible else 0.0
+            if verifier_hard_penalty:
+                _apply_verifier_hard_penalties(
+                    traj_items,
+                    train_roles,
+                    negative_reward_scale=verifier_negative_reward_scale,
+                    redistribute_positive_share=False,
+                    credit_basis=credit_basis,
+                )
             continue
-
-        credits = [_outcome_credit(item["breakdown"], credit_basis) for item in eligible]
-        credit_sum = sum(credits)
-        if credit_sum <= eps:
-            credits = [1.0 for _ in eligible]
-            credit_sum = float(len(eligible))
 
         reward_mass = global_reward * success_reward_scale
         for item in traj_items:
             item["breakdown"].node_reward = 0.0
-        for item, credit in zip(eligible, credits, strict=True):
-            item["breakdown"].node_reward = float(reward_mass * credit / credit_sum)
+        shares = _allocate_success_reward(
+            eligible,
+            credit_basis,
+            solver_min_success_share=solver_min_success_share,
+            verifier_max_success_share=verifier_max_success_share,
+        )
+        for item, share in zip(eligible, shares, strict=True):
+            item["breakdown"].node_reward = float(reward_mass * share)
+            item["breakdown"].details["outcome_reward_share"] = float(share)
+        if verifier_hard_penalty:
+            _apply_verifier_hard_penalties(
+                traj_items,
+                train_roles,
+                negative_reward_scale=verifier_negative_reward_scale,
+                redistribute_positive_share=redistribute_verifier_penalty_share,
+                credit_basis=credit_basis,
+            )
+
+
+def _apply_verifier_hard_penalties(
+    traj_items: list[dict[str, Any]],
+    train_roles: list[str],
+    negative_reward_scale: float,
+    redistribute_positive_share: bool,
+    credit_basis: str,
+) -> None:
+    if negative_reward_scale <= 0.0:
+        return
+
+    penalized: list[tuple[dict[str, Any], float]] = []
+    for item in traj_items:
+        node = item["node"]
+        if not is_verifier_node_type(node.node_type) or not _role_is_trainable(node, train_roles):
+            continue
+        breakdown = item["breakdown"]
+        diagnostic_reward = _negative_verifier_diagnostic_reward(
+            breakdown.details.get("verifier_diagnostics", {})
+        )
+        if diagnostic_reward >= 0.0:
+            continue
+
+        old_reward = float(breakdown.node_reward)
+        penalty_reward = float(diagnostic_reward * negative_reward_scale)
+        breakdown.node_reward = penalty_reward
+        breakdown.details["verifier_hard_penalty_applied"] = True
+        breakdown.details["pre_verifier_penalty_node_reward"] = old_reward
+        breakdown.details["verifier_penalty_reward"] = penalty_reward
+        breakdown.details["verifier_penalty_source_reward"] = diagnostic_reward
+        penalized.append((item, max(old_reward, 0.0)))
+
+    if not redistribute_positive_share or not penalized:
+        return
+
+    returned_mass = sum(old_positive for _, old_positive in penalized)
+    if returned_mass <= 1e-8:
+        return
+
+    penalized_ids = {id(item) for item, _ in penalized}
+    recipients = [
+        item
+        for item in traj_items
+        if id(item) not in penalized_ids
+        and _role_is_trainable(item["node"], train_roles)
+        and float(item["breakdown"].node_reward) >= 0.0
+    ]
+    if not recipients:
+        return
+
+    weights = [max(float(item["breakdown"].node_reward), 0.0) for item in recipients]
+    if sum(weights) <= 1e-8:
+        weights = [_outcome_credit(item["breakdown"], credit_basis) for item in recipients]
+    shares = _normalize_shares(weights)
+    for item, share in zip(recipients, shares, strict=True):
+        bonus = float(returned_mass * share)
+        breakdown = item["breakdown"]
+        breakdown.node_reward = float(breakdown.node_reward + bonus)
+        breakdown.details["verifier_penalty_redistributed_bonus"] = float(
+            breakdown.details.get("verifier_penalty_redistributed_bonus", 0.0) + bonus
+        )
+
+
+def _negative_verifier_diagnostic_reward(diagnostics: Any) -> float:
+    diagnostics = _to_plain_container(diagnostics) or {}
+    if not isinstance(diagnostics, Mapping):
+        return 0.0
+    try:
+        verifier_reward = float(diagnostics.get("verifier_reward", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        verifier_reward = 0.0
+    if verifier_reward < 0.0:
+        return verifier_reward
+
+    format_valid = bool(diagnostics.get("format_valid", True))
+    contradiction = bool(diagnostics.get("contradiction", False))
+    try:
+        verify_tag_count = int(diagnostics.get("verify_tag_count", 1) or 0)
+    except (TypeError, ValueError):
+        verify_tag_count = 0
+    if not format_valid or contradiction or verify_tag_count != 1:
+        return -0.5
+    return 0.0
 
 
 def _outcome_credit(breakdown: RewardBreakdown, credit_basis: str) -> float:
@@ -263,6 +370,89 @@ def _outcome_credit(breakdown: RewardBreakdown, credit_basis: str) -> float:
         f"Unsupported graphcredit.outcome_redistribution.credit_basis={credit_basis!r}. "
         "Expected counterfactual, process, counterfactual_process, hybrid, or uniform."
     )
+
+
+def _allocate_success_reward(
+    eligible: list[dict[str, Any]],
+    credit_basis: str,
+    solver_min_success_share: float,
+    verifier_max_success_share: float,
+) -> list[float]:
+    eps = 1e-8
+    credits = [_outcome_credit(item["breakdown"], credit_basis) for item in eligible]
+    if sum(credits) <= eps:
+        credits = [1.0 for _ in eligible]
+    shares = _normalize_shares(credits)
+
+    solver_indices = [idx for idx, item in enumerate(eligible) if is_solver_node_type(item["node"].node_type)]
+    verifier_indices = [idx for idx, item in enumerate(eligible) if is_verifier_node_type(item["node"].node_type)]
+
+    solver_min_success_share = clip_fraction(solver_min_success_share)
+    verifier_max_success_share = clip_fraction(verifier_max_success_share)
+    shares = _raise_group_floor(shares, solver_indices, solver_min_success_share)
+    shares = _cap_group_share(shares, verifier_indices, verifier_max_success_share)
+    return _normalize_shares(shares)
+
+
+def _normalize_shares(values: list[float]) -> list[float]:
+    total = sum(max(float(value), 0.0) for value in values)
+    if total <= 1e-8:
+        return [1.0 / len(values) for values in values] if values else []
+    return [max(float(value), 0.0) / total for value in values]
+
+
+def _raise_group_floor(shares: list[float], indices: list[int], floor: float) -> list[float]:
+    if not shares or not indices or floor <= 0.0:
+        return shares
+    group_sum = sum(shares[idx] for idx in indices)
+    if group_sum >= floor:
+        return shares
+    other_indices = [idx for idx in range(len(shares)) if idx not in set(indices)]
+    other_sum = sum(shares[idx] for idx in other_indices)
+    new_shares = list(shares)
+    if group_sum <= 1e-8:
+        per_group = floor / len(indices)
+        for idx in indices:
+            new_shares[idx] = per_group
+    else:
+        scale = floor / group_sum
+        for idx in indices:
+            new_shares[idx] *= scale
+    remaining = max(0.0, 1.0 - floor)
+    if other_indices and other_sum > 1e-8:
+        for idx in other_indices:
+            new_shares[idx] = shares[idx] * remaining / other_sum
+    elif other_indices:
+        per_other = remaining / len(other_indices)
+        for idx in other_indices:
+            new_shares[idx] = per_other
+    return new_shares
+
+
+def _cap_group_share(shares: list[float], indices: list[int], cap: float) -> list[float]:
+    if not shares or not indices or cap >= 1.0:
+        return shares
+    group_sum = sum(shares[idx] for idx in indices)
+    if group_sum <= cap:
+        return shares
+    other_indices = [idx for idx in range(len(shares)) if idx not in set(indices)]
+    other_sum = sum(shares[idx] for idx in other_indices)
+    new_shares = list(shares)
+    for idx in indices:
+        new_shares[idx] = shares[idx] * cap / group_sum
+    remaining = max(0.0, 1.0 - cap)
+    if other_indices and other_sum > 1e-8:
+        for idx in other_indices:
+            new_shares[idx] = shares[idx] * remaining / other_sum
+    elif other_indices:
+        per_other = remaining / len(other_indices)
+        for idx in other_indices:
+            new_shares[idx] = per_other
+    return new_shares
+
+
+def clip_fraction(value: float) -> float:
+    return min(1.0, max(0.0, float(value)))
 
 
 def _role_is_trainable(node: EventNode, train_roles: list[str]) -> bool:
@@ -302,6 +492,11 @@ def _outcome_reward_metrics(pending_items: list[dict[str, Any]], reward_mode: st
         for item in pending_items
         if _normalize_key(str(item["node"].agent_id or item["node"].role or "")) == "verifier"
     ]
+    verifier_penalty_flags = [
+        bool(item["breakdown"].details.get("verifier_hard_penalty_applied", False))
+        for item in pending_items
+        if is_verifier_node_type(item["node"].node_type)
+    ]
 
     metrics = {
         "graphcredit/outcome_reward_mode": 1.0 if reward_mode == "outcome_redistribution" else 0.0,
@@ -309,11 +504,15 @@ def _outcome_reward_metrics(pending_items: list[dict[str, Any]], reward_mode: st
         "graphcredit/failed_node_reward_mean": float(np.mean(failed_rewards)) if failed_rewards else 0.0,
         "graphcredit/failed_positive_node_ratio": float(np.mean([reward > 0.0 for reward in failed_rewards])) if failed_rewards else 0.0,
         "graphcredit/positive_node_ratio": float(np.mean([reward > 0.0 for reward in rewards])) if rewards else 0.0,
+        "graphcredit/negative_node_ratio": float(np.mean([reward < 0.0 for reward in rewards])) if rewards else 0.0,
     }
     if solver_rewards:
         metrics["graphcredit/solver_node_reward_mean"] = float(np.mean(solver_rewards))
     if verifier_rewards:
         metrics["graphcredit/verifier_node_reward_mean"] = float(np.mean(verifier_rewards))
+        metrics["graphcredit/verifier_negative_node_ratio"] = float(np.mean([reward < 0.0 for reward in verifier_rewards]))
+    if verifier_penalty_flags:
+        metrics["graphcredit/verifier_hard_penalty_ratio"] = float(np.mean(verifier_penalty_flags))
     return metrics
 
 
@@ -354,7 +553,7 @@ def _normalize_key(value: str) -> str:
 
 
 def _failed_math_solver_cost_floor(task_type: str, global_reward: float, node: EventNode, cost: float) -> float:
-    if task_type != "math" or global_reward > 0.0 or node.node_type not in {"agent_message", "agent_action"}:
+    if task_type != "math" or global_reward > 0.0 or not is_solver_node_type(node.node_type):
         return cost
     output = node.output_content or ""
     if "\\boxed" not in output:
@@ -394,8 +593,8 @@ def _decode_batch(data, tokenizers: dict[str, Any] | None = None) -> list[tuple[
         prompt_length = item.batch["prompts"].shape[-1]
         valid_prompt_length = int(item.batch["attention_mask"][:prompt_length].sum().item())
         valid_response_length = int(item.batch["attention_mask"][prompt_length:].sum().item())
-        prompt = tokenizer.decode(item.batch["prompts"][-valid_prompt_length:], skip_special_tokens=False)
-        response = tokenizer.decode(item.batch["responses"][:valid_response_length], skip_special_tokens=True)
+        prompt = sanitize_text(tokenizer.decode(item.batch["prompts"][-valid_prompt_length:], skip_special_tokens=False))
+        response = sanitize_text(tokenizer.decode(item.batch["responses"][:valid_response_length], skip_special_tokens=True))
         decoded.append((prompt, response))
     return decoded
 

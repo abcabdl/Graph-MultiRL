@@ -31,14 +31,13 @@ class MathProcessScorer:
             reason = "final answer combines correctness, answer format, and mild length support"
         elif is_verifier_node_type(node.node_type):
             diagnostics = math_verifier_diagnostics(graph, node)
-            if node.node_type == "router_decision":
-                score = max(0.0, diagnostics.verifier_reward)
-            else:
-                score = max(0.0, diagnostics.verifier_reward)
+            score = max(0.0, diagnostics.verifier_reward)
             if diagnostics.verdict == "reject" and diagnostics.explained and diagnostics.after_correct and not diagnostics.before_correct:
-                score = min(1.0, score + 0.15)
+                score = min(1.0, score + 0.05)
             if diagnostics.verdict == "approve" and not diagnostics.before_correct:
                 score = max(0.0, score - 0.15)
+            if not diagnostics.format_valid or diagnostics.contradiction:
+                score = 0.0
             reason = diagnostics.reason
         else:
             if _is_too_short(output) and final_reward <= 0:

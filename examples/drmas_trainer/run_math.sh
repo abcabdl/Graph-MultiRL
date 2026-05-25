@@ -35,12 +35,13 @@ model_sharing=False
 
 orchestra_type=math
 max_loop_num=2
+total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 # Agent-specific parameter override (only support actor_rollout_ref)
 
 # actor_optim_lr='[1e-6,1e-6]'
 actor_optim_lr='[1e-6,2e-7]'
-actor_ppo_micro_batch_size_per_gpu='[4,4]'
+actor_ppo_micro_batch_size_per_gpu='[1,1]'
 
 model_name_tag=$(jq -r '.[]' <<< "$model_ids"  | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]' | tr '-' '_' | paste -sd_)
 
@@ -71,10 +72,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=sglang \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.30 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -99,8 +100,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="$experiment_name" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
-    trainer.test_freq=10 \
+    trainer.save_freq=100 \
+    trainer.test_freq=50 \
+    trainer.total_training_steps=$total_training_steps \
     trainer.total_epochs=2 \
     trainer.val_only=$VAL_ONLY \
     trainer.val_before_train=True \

@@ -9,6 +9,7 @@ from graphcredit_offline.rewards.cost import cost_penalty, redundancy_penalty
 from graphcredit_offline.rewards.downstream_usage import downstream_usage_score
 from graphcredit_offline.rewards.fusion import fuse_node_reward
 from graphcredit_offline.rewards.math_scorer import MathProcessScorer
+from graphcredit_offline.rewards.verifier_diagnostics import math_verifier_diagnostics, verifier_verdict
 
 
 def test_math_process_and_counterfactual_reward_are_bounded():
@@ -345,6 +346,197 @@ def test_outcome_redistribution_sends_success_reward_to_train_role_only():
     assert verifier_breakdown.node_reward == 0.0
 
 
+def test_outcome_redistribution_caps_verifier_and_keeps_solver_share():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="valid reasoning \\boxed{1}",
+        final_reward=1.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_correction",
+        time_step=2,
+        input_context="solution",
+        output_content="<verify>reject</verify> corrected answer should be \\boxed{1}",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=1.0)
+    solver_breakdown = RewardBreakdown("solver", 1.0, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0)
+    verifier_breakdown = RewardBreakdown("verifier", 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    pending = [
+        {"node": solver, "graph": graph, "breakdown": solver_breakdown},
+        {"node": verifier, "graph": graph, "breakdown": verifier_breakdown},
+    ]
+
+    _apply_outcome_redistribution(
+        pending,
+        {
+            "outcome_redistribution": {
+                "success_reward_scale": 1.0,
+                "credit_basis": "counterfactual_process",
+                "solver_min_success_share": 0.55,
+                "verifier_max_success_share": 0.35,
+            }
+        },
+    )
+
+    assert solver_breakdown.node_reward >= 0.55
+    assert verifier_breakdown.node_reward <= 0.35
+
+
+def test_outcome_redistribution_penalizes_rejecting_correct_verifier_after_success_allocation():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_final_answer",
+        time_step=1,
+        input_context="problem",
+        output_content="x = 1 therefore \\boxed{1}",
+        final_reward=1.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="x = 1 therefore \\boxed{1}",
+        output_content="<verify>reject</verify> the substitution is wrong",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=1.0)
+    diagnostics = math_verifier_diagnostics(graph, verifier)
+    solver_breakdown = RewardBreakdown("solver", 1.0, 0.8, 0.8, 0.0, 0.0, 0.0, 0.0)
+    verifier_breakdown = RewardBreakdown("verifier", 1.0, 0.8, 0.8, 0.0, 0.0, 0.0, 0.0)
+    verifier_breakdown.details["verifier_diagnostics"] = diagnostics.__dict__
+    pending = [
+        {"node": solver, "graph": graph, "breakdown": solver_breakdown},
+        {"node": verifier, "graph": graph, "breakdown": verifier_breakdown},
+    ]
+
+    _apply_outcome_redistribution(
+        pending,
+        {
+            "outcome_redistribution": {
+                "success_reward_scale": 1.0,
+                "credit_basis": "counterfactual",
+                "verifier_negative_reward_scale": 0.25,
+                "redistribute_verifier_penalty_share": True,
+            }
+        },
+    )
+
+    assert verifier_breakdown.node_reward < 0.0
+    assert verifier_breakdown.details["verifier_hard_penalty_applied"]
+    assert solver_breakdown.node_reward > 0.65
+
+
+def test_outcome_redistribution_penalizes_approve_wrong_on_failed_trajectory():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_final_answer",
+        time_step=1,
+        input_context="problem",
+        output_content="bad arithmetic therefore \\boxed{999}",
+        final_reward=0.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="bad arithmetic therefore \\boxed{999}",
+        output_content="<verify>approve</verify>",
+        final_reward=0.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=0.0)
+    diagnostics = math_verifier_diagnostics(graph, verifier)
+    solver_breakdown = RewardBreakdown("solver", 0.0, 0.0, -0.2, 0.0, 0.0, 0.0, 0.3)
+    verifier_breakdown = RewardBreakdown("verifier", 0.0, 0.0, -0.2, 0.0, 0.0, 0.0, 0.3)
+    verifier_breakdown.details["verifier_diagnostics"] = diagnostics.__dict__
+    pending = [
+        {"node": solver, "graph": graph, "breakdown": solver_breakdown},
+        {"node": verifier, "graph": graph, "breakdown": verifier_breakdown},
+    ]
+
+    _apply_outcome_redistribution(
+        pending,
+        {
+            "outcome_redistribution": {
+                "failed_node_reward": 0.0,
+                "verifier_negative_reward_scale": 0.25,
+            }
+        },
+    )
+
+    assert solver_breakdown.node_reward == 0.0
+    assert verifier_breakdown.node_reward < 0.0
+    assert verifier_breakdown.details["verifier_hard_penalty_applied"]
+
+
+def test_outcome_redistribution_penalizes_invalid_verifier_format():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_final_answer",
+        time_step=1,
+        input_context="problem",
+        output_content="x = 1 therefore \\boxed{1}",
+        final_reward=1.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="x = 1 therefore \\boxed{1}",
+        output_content="<verify>reject</verify> reconsidered <verify>approve</verify>",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=1.0)
+    diagnostics = math_verifier_diagnostics(graph, verifier)
+    solver_breakdown = RewardBreakdown("solver", 1.0, 0.8, 0.8, 0.0, 0.0, 0.0, 0.0)
+    verifier_breakdown = RewardBreakdown("verifier", 1.0, 0.8, 0.8, 0.0, 0.0, 0.0, 0.0)
+    verifier_breakdown.details["verifier_diagnostics"] = diagnostics.__dict__
+    pending = [
+        {"node": solver, "graph": graph, "breakdown": solver_breakdown},
+        {"node": verifier, "graph": graph, "breakdown": verifier_breakdown},
+    ]
+
+    _apply_outcome_redistribution(
+        pending,
+        {
+            "outcome_redistribution": {
+                "verifier_negative_reward_scale": 0.25,
+            }
+        },
+    )
+
+    assert not diagnostics.format_valid
+    assert verifier_breakdown.node_reward < 0.0
+
+
 def test_verifier_rejecting_correct_solver_answer_gets_negative_counterfactual_credit():
     solver = EventNode(
         node_id="solver",
@@ -375,6 +567,104 @@ def test_verifier_rejecting_correct_solver_answer_gets_negative_counterfactual_c
 
     assert process.score == 0.0
     assert cf.credit < 0.0
+
+
+def test_verifier_diagnostics_recognizes_refined_solver_node_types():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="x = 1 therefore \\boxed{1}",
+        final_reward=1.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="x = 1 therefore \\boxed{1}",
+        output_content="The arithmetic is correct.\n<verify>approve</verify>",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=1.0)
+
+    diagnostics = math_verifier_diagnostics(graph, verifier)
+
+    assert diagnostics.before_correct
+    assert diagnostics.verifier_reward > 0.0
+
+
+def test_verifier_verdict_uses_last_tag_and_penalizes_multi_tag():
+    assert verifier_verdict("<verify>reject</verify> reconsidered <verify>approve</verify>") == "approve"
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="x = 1 therefore \\boxed{1}",
+        final_reward=1.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="x = 1 therefore \\boxed{1}",
+        output_content="<verify>reject</verify> I reconsider: the answer is correct. <verify>approve</verify>",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=1.0)
+
+    diagnostics = math_verifier_diagnostics(graph, verifier)
+
+    assert diagnostics.verdict == "approve"
+    assert diagnostics.verify_tag_count == 2
+    assert not diagnostics.format_valid
+    assert diagnostics.verifier_reward < 0.0
+    assert MathProcessScorer().score(graph, verifier).score == 0.0
+
+
+def test_reject_that_says_solution_is_correct_is_penalized():
+    solver = EventNode(
+        node_id="solver",
+        trajectory_id="t1",
+        agent_id="Solver Agent",
+        role="solver",
+        node_type="solver_reasoning",
+        time_step=1,
+        input_context="problem",
+        output_content="x = 1 therefore \\boxed{1}",
+        final_reward=1.0,
+    )
+    verifier = EventNode(
+        node_id="verifier",
+        trajectory_id="t1",
+        agent_id="Verifier Agent",
+        role="verifier",
+        node_type="verifier_check",
+        time_step=2,
+        input_context="x = 1 therefore \\boxed{1}",
+        output_content="After reviewing, the solution is actually correct.\n<verify>reject</verify>",
+        final_reward=1.0,
+    )
+    graph = build_event_graph("t1", [solver, verifier], task_type="math", final_reward=1.0)
+
+    diagnostics = math_verifier_diagnostics(graph, verifier)
+
+    assert diagnostics.contradiction
+    assert diagnostics.verifier_reward < 0.0
+    assert MathProcessScorer().score(graph, verifier).score == 0.0
 
 
 def test_verifier_correction_gain_uses_sample_index_when_time_step_ties():
@@ -420,7 +710,7 @@ def test_verifier_correction_gain_uses_sample_index_when_time_step_ties():
     cf = offline_masking_credit(graph, verifier, process_reward=process.score, task_type="math")
 
     assert process.score > 0.5
-    assert cf.credit == 0.7
+    assert cf.credit == 0.6
 
 
 def test_failed_downstream_usage_ignores_overlap_with_wrong_final_answer():

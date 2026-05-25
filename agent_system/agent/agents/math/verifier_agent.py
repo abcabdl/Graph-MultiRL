@@ -20,6 +20,7 @@ from agent_system.multi_turn_rollout.utils import preprocess_batch
 from agent_system.agent.registry import AgentRegistry
 from agent_system.agent.agents.base import BaseAgent
 from agent_system.agent.utils import general_projection
+from graphcredit_offline.core.verify_tags import has_single_final_verifier_tag, last_verifier_verdict
 import numpy as np
 
 
@@ -31,12 +32,14 @@ VERIFIER_PROMPT = """
 {team_context}
 
 # Your Role
-You are a "Verifier Agent". Your responsibility is to critically review the most recent solution provided by the "Solver Agent". Check each reasoning step, formula, and conclusion for accuracy, completeness, and logical consistency.
-At the end of your output, you MUST provide your verdict within <verify> </verify> using exactly one of:
-(1) <verify>approve</verify> if all steps and the final answer are correct.
-(2) <verify>reject</verify> if you detect any issue.
+You are a "Verifier Agent". Review only the latest Solver Agent solution.
+Be concise: use at most 3 short bullets, and mention only material mathematical errors or missing steps.
+Do not rewrite the whole solution. Do not speculate about minor style issues.
+Your final line MUST be exactly one verdict tag:
+<verify>approve</verify> if the reasoning and final answer are correct.
+<verify>reject</verify> if there is any material mathematical error or unsupported final answer.
+Use exactly one <verify>...</verify> tag, only on the final line.
 """
-
 
 @AgentRegistry.register("Verifier Agent")
 class VerifierAgent(BaseAgent):
@@ -63,6 +66,8 @@ class VerifierAgent(BaseAgent):
             check_think_tag=False,
             return_whole_response=True,
         )
+        strict_valids = np.array([has_single_final_verifier_tag(text) for text in text_repsonses], dtype=bool)
+        valids = np.logical_and(valids, strict_valids)
         batch.non_tensor_batch['is_action_valid'] = valids
         batch.non_tensor_batch['env_step'] = np.array([step] * len(text_repsonses), dtype=object)
         return batch, text_repsonses
@@ -74,9 +79,10 @@ class VerifierAgent(BaseAgent):
         new_approved_vector: List[bool] = []
         for i in range(len(text_repsonses)):
             if agent_active_mask[i]:
-                if "<verify>approve</verify>" in text_repsonses[i]:
+                verdict = last_verifier_verdict(text_repsonses[i])
+                if verdict == "approve":
                     new_approved_vector.append(True)
-                elif "<verify>reject</verify>" in text_repsonses[i]:
+                elif verdict == "reject":
                     new_approved_vector.append(False)
                 else:
                     new_approved_vector.append(True)
@@ -86,5 +92,3 @@ class VerifierAgent(BaseAgent):
         new_approved_vector = np.array(new_approved_vector, dtype=bool)
         updated_vector = np.logical_or(approved_vector, new_approved_vector).astype(bool)
         return updated_vector
-
-
